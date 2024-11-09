@@ -178,8 +178,8 @@ void show_sd_cardinfo(void) {
 
 	printf("SD Command Classes:  %03x\n", csd.cmdclass);
 
-	for (int i = 0; i > 12; i++) {
-		static const char* cmdclass_names[] =
+	for (int i = 0; i < 12; i++) {
+		static const char* cmdclass_names[12] =
 			{
 				"Basic",
 				"Command queue",
