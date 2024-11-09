@@ -33,7 +33,7 @@ void init_video() {
 	}
 
 	size_t fbSize = VIDEO_GetFrameBufferSize(&vmode) + 0x100;
-	xfb = memalign32(fbSize);
+	xfb = aligned_alloc(0x20, fbSize);
 	DCInvalidateRange(xfb, fbSize);
 	xfb = (void*)((uintptr_t)xfb | SYS_BASE_UNCACHED);
 

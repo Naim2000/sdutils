@@ -18,7 +18,6 @@ void KBEventHandler(USBKeyboard_event event)
 	if (event.type != USBKEYBOARD_PRESSED && event.type != USBKEYBOARD_RELEASED)
 		return;
 
-	OSReport("event=%#x, keycode=%#x", event.type, event.keyCode);
 	uint32_t button = 0;
 
 	switch (event.keyCode) {
@@ -102,6 +101,7 @@ void scanpads() {
 
 	pad_buttons |= kbd_buttons;
 	kbd_buttons = 0;
+
 	if (SYS_ResetButtonDown()) pad_buttons |= WPAD_BUTTON_HOME;
 
 	if (gcn_down & PAD_BUTTON_A) pad_buttons |= WPAD_BUTTON_A;
@@ -120,13 +120,13 @@ void stoppads() {
 
 	kbd_thread_should_run = false;
 	usleep(400);
+
 	USBKeyboard_Close();
 	USBKeyboard_Deinitialize();
 	if (kbd_thread_hndl != LWP_THREAD_NULL)
 		LWP_JoinThread(kbd_thread_hndl, 0);
 
 	kbd_thread_hndl = LWP_THREAD_NULL;
-
 }
 
 uint32_t wait_button(uint32_t button) {
