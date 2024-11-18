@@ -169,7 +169,10 @@ static int _SelectionMenu(const char* const options[]) {
 	int count = -1;
 	while (options[++count]);
 
-	if (posY + count > conY) posY = (conY - 1) - count;
+	if (posY + count >= conY) {
+		posY = (conY - 1) - count;
+		putchar('\n');
+	}
 
 	while (true) {
 		printf("\x1b[%i;0H", posY);
@@ -347,7 +350,7 @@ void show_sd_bsinfo(u32 sector) {
 
 				struct mbr* mbr = (struct mbr*)sector_data;
 
-				int resp = SelectionMenu("Partition 1", "Partition 2", "Partition 3", "Partition 4", "Cancel");
+				int resp = SelectionMenu("+ Partition 1", "+ Partition 2", "+ Partition 3", "+ Partition 4", "- Cancel");
 				if (resp <= 0 || resp > 4)
 					continue;
 
