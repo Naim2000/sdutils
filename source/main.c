@@ -2,19 +2,22 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/statvfs.h>
 #include <gccore.h>
+#include <fat.h>
 #include <ogc/sha.h>
 #include <ogc/aes.h>
 
 #include "video.h"
 #include "pad.h"
 #include "sd.h"
+#include "sd_dvm.h"
 
 #define bswap16 __builtin_bswap16
 #define bswap32 __builtin_bswap32
 #define isPowerOfTwo(x) (x && (x & (x - 1)) == 0)
 
-union __attribute__((packed)) chs {
+typedef union __attribute__((packed)) CHS {
 	u8 chs8[3];
 	u32 chs24: 24;
 	struct {
@@ -23,24 +26,33 @@ union __attribute__((packed)) chs {
 		u8 sector: 6;
 		u8 cylinder_l;
 	};
-};
+} CHS;
+
+typedef enum MBRPartitionType: u8 {
+	None   = 0x00,
+	FAT12C = 0x01,
+	FAT16B = 0x04,
+	FAT16C = 0x06,
+	exFAT  = 0x07,
+	NTFS   = 0x07,
+	FAT32C = 0x0b,
+	FAT32L = 0x0c,
+	FAT16L = 0x0e,
+	Linux  = 0x83,
+	GPT    = 0xee,
+} MBRPartitionType;
 
 typedef struct __attribute__((packed)) MBRPartition {
-	union {
-		u8 status;
-		struct {
-			u8 active: 1;
-			u8 :0;
-		};
-	};
-	union chs chs_start;
-	u8  type;
-	union chs chs_end;
-	u32 lba_start;
-	u32 lba_count;
+	u8                status;
+	CHS               chs_start;
+	MBRPartitionType  type;
+	CHS               chs_end;
+	u32               lba_start;
+	u32               lba_count;
 } MBRPartition;
 _Static_assert(sizeof(MBRPartition) == 0x10, "MBRPartition size incorrect");
 
+// Thank you sdFormatLinux
 typedef struct __attribute__((packed)) bootsect {
 	union __attribute__((packed)) {
 		struct __attribute__((packed)) mbr {
@@ -63,15 +75,15 @@ typedef struct __attribute__((packed)) bootsect {
 			u32  numHiddenSectors;
 			u32  totalSectors32;
 			union __attribute__((packed)) {
-				struct __attribute__((packed)) ebpb {
+				struct __attribute__((packed)) vi {
 					u8   driveNumber;
 					u8   reserved;
-					u8   extBootSig;
+					u8   extBootSig; // 0x29
 					u32  volumeID;
 					char volumeLabel[11];
 					char fsType[8];
-					u8 code[448];
-				} ebpb[1];
+					u8   code[];
+				} ebpb;
 				struct __attribute__((packed)) {
 					u32  sectorsPerFAT;
 					u16  extFlags;
@@ -80,20 +92,29 @@ typedef struct __attribute__((packed)) bootsect {
 					u16  fsInfoSector;
 					u16  bkBootSector;
 					u8   reserved[12];
-					u8   driveNumber;
-					u8   reserved1;
-					u8   extBootSig;
-					u32  volumeID;
-					char volumeLabel[11];
-					char fsType[8];
-					u8 code[420];
+					struct vi vi;
 				} ebpb32[1];
 			};
 		} fat_vbr;
 	};
 	u16 sig;
 } bootsect;
-_Static_assert(sizeof(bootsect) == 0x200 && offsetof(bootsect, sig) == 0x1FE, "Boot sector is not a sector");
+_Static_assert(sizeof(bootsect) == 0x200, "Boot sector is not a sector");
+
+#define FSI_SIGNATURE1 0x52526141
+#define FSI_SIGNATURE2 0x72724161
+#define FSI_SIGNATURE3 0x000055AA
+// FAT32
+typedef struct __attribute__((packed)) FSInfoSector {
+	u32 signature1;
+	u8  unused1[0x1E0];
+	u32 signature2;
+	u32 freeClusters;
+	u32 lastAllocatedCluster;
+	u8  unused2[0xC];
+	u32 signature3;
+} FSInfoSector;
+_Static_assert(sizeof(FSInfoSector) == 0x200, "FS Info sector is not a sector");
 
 enum {
 	Invalid = -1,
@@ -112,7 +133,7 @@ static int examine_bootsector(void* ptr) {
 	// FATFS style
 	if (has_jmp_instr) {
 		struct fat_vbr* vbr = &bootsect->fat_vbr;
-		if (has_sig_55AA && !memcmp(vbr->ebpb32->fsType, "FAT32   ", 8)) {
+		if (has_sig_55AA && !memcmp(vbr->ebpb32->vi.fsType, "FAT32   ", 8)) {
 			return FAT32;
 		}
 		else if (has_jmp_instr &&
@@ -231,85 +252,154 @@ void show_sd_cardinfo(void) {
 	printf("Nintendo 3DS ID1:    %08x%08x%08x%08x\n", cid_raw[0], cid_raw[1], cid_raw[2], cid_raw[3]);
 }
 
+static void print_bsinfo(u32* sector) {
+	int type = examine_bootsector(sector);
+	switch (type) {
+		case MBR: {
+			struct mbr* mbr = (struct mbr*)sector;
+
+			printf("Boot sector type: MBR\n");
+			for (int i = 0; i < 4; i++) {
+				MBRPartition* part = &mbr->partitions[i];
+				if (part->type) {
+					printf("Partition %i:\n", i + 1);
+
+					printf("+ Type:        %#x\n", part->type);
+					printf("+ Active:      %s\n", part->status & 0x80 ? "Yes" : "No");
+					if (part->chs_start.chs24 != 0xFFFFFF && part->chs_start.sector) {
+						printf("+ Start (CHS): %u-%u-%u\n", part->chs_start.cylinder_h << 8 | part->chs_start.cylinder_l, part->chs_start.head, part->chs_start.sector);
+						printf("+ End (CHS):   %u-%u-%u\n", part->chs_end.cylinder_h << 8 | part->chs_end.cylinder_l, part->chs_end.head, part->chs_end.sector);
+					}
+					printf("+ Start (LBA): %#x (%u)\n", bswap32(part->lba_start), bswap32(part->lba_start));
+					printf("+ Size (LBA):  %#x (%u)\n", bswap32(part->lba_count), bswap32(part->lba_count));
+				}
+			}
+		} break;
+
+		case FAT:
+		case FAT32: {
+			struct fat_vbr* vbr = (struct fat_vbr*)sector;
+			struct vi* vi       = (type == FAT32) ? &vbr->ebpb32->vi : &vbr->ebpb;
+
+			printf("Boot sector type:    VFAT\n");
+
+			u16 logicalSectorSize = bswap16(vbr->bytesPerSector);
+			u8  sectorsPerCluster = vbr->sectorsPerCluster;
+			u16 clusterSize       = logicalSectorSize * sectorsPerCluster;
+
+			printf("OEM name:            %s\n", vbr->oemName);
+			printf("Cluster size:        %u\n", clusterSize);
+			printf("Reserved sectors:    %u\n", bswap16(vbr->reservedSectors));
+			printf("# of FATs:           %u\n", vbr->numFATs);
+			printf("Media descriptor:    %#x\n", vbr->mediaType);
+			if (vi->extBootSig == 0x29) {
+				u32 volumeID          = bswap32(vi->volumeID);
+				printf("Filesystem type:     %.8s\n", vi->fsType);
+				printf("Volume label:        %.11s\n", (memcmp(vi->volumeLabel, "NO NAME    ", 11) == 0 ? "<none>" : vi->volumeLabel));
+				printf("Volume ID:           %04hX-%04hX\n", (u16)(volumeID >> 16), (u16)(volumeID));
+			}
+		} break;
+
+		default:
+			printf("Boot sector type: unknown (%i)\n", type);
+			break;
+	}
 }
 
-void show_sd_bsinfo(void) {
-	static u32 sector0[0x80];
 
-	int ret = sd_read(0, 1, sector0);
+void show_sd_bsinfo(u32 sector) {
+	u32 sector_data[0x80];
+
+	if (!(sd_status() & SD_INITIALIZED)) {
+		printf("SD card not initialized?");
+		return;
+	}
+
+	int ret = sd_read(sector, 1, sector_data);
 	if (ret < 0) {
 		printf("sd_read failed (%i)\n", ret);
 		return;
 	}
-	int type = examine_bootsector(sector0);
 
 	while (true) {
 		clear();
-		switch (type) {
-			case MBR: {
-				struct mbr* mbr = (struct mbr*)sector0;
-
-				printf("Boot sector type: MBR\n");
-				for (int i = 0; i < 4; i++) {
-					MBRPartition* part = &mbr->partitions[i];
-					if (part->type) {
-						printf("Partition %i:\n", i + 1);
-
-						printf("+ Type:        %#x\n", part->type);
-						printf("+ Active:      %s\n", part->active ? "Yes" : "No");
-						if (part->chs_start.chs24 != 0xFFFFFF && part->chs_start.sector) {
-							printf("+ Start (CHS): %u-%u-%u\n", part->chs_start.cylinder_h << 8 | part->chs_start.cylinder_l, part->chs_start.head, part->chs_start.sector);
-							printf("+ End (CHS):   %u-%u-%u\n", part->chs_end.cylinder_h << 8 | part->chs_end.cylinder_l, part->chs_end.head, part->chs_end.sector);
-						}
-						printf("+ Start (LBA): %#x (%u)\n", bswap32(part->lba_start), bswap32(part->lba_start));
-						printf("+ Size (LBA):  %#x (%u)\n", bswap32(part->lba_count), bswap32(part->lba_count));
-					}
-				}
-			} break;
-
-			case FAT:
-			case FAT32: {
-				struct fat_vbr* vbr = (struct fat_vbr*)sector0;
-
-				printf("Boot sector type:    FAT\n");
-				u16 logicalSectorSize = bswap16(vbr->bytesPerSector);
-				u8  sectorsPerCluster = vbr->sectorsPerCluster;
-				u16 clusterSize       = logicalSectorSize * sectorsPerCluster;
-				u16 reservedSectors   = bswap16(vbr->reservedSectors);
-				u8  numFATs           = vbr->numFATs;
-				u8  mediaType         = vbr->mediaType;
-
-				printf("OEM name:            %s\n", vbr->oemName);
-				printf("Cluster size:        %u\n", clusterSize);
-				printf("Reserved sectors:    %u\n", reservedSectors);
-				printf("# of FATs:           %u\n", numFATs);
-				printf("Media descriptor:    %#x\n", mediaType);
-			}
-			break;
-
-			default:
-				printf("Boot sector type: unknown (%i)\n", type);
-				break;
-		}
+		print_bsinfo(sector_data);
 
 		printf("\n");
-		switch (SelectionMenu("Show raw sector 0", "Back")) {
+		switch (SelectionMenu("Show raw sector data", "(MBR) Show partition boot sector", "Back")) {
 			case 1: {
 				clear();
-				printf("Sector 0 data:\n");
+				printf("Sector data:\n");
 				for (int i = 0; i < 0x80; i += 8)
 					printf("%08x %08x %08x %08x %08x %08x %08x %08x\n",
-						   sector0[i+0], sector0[i+1], sector0[i+2], sector0[i+3], sector0[i+4], sector0[i+5], sector0[i+6], sector0[i+7]);
+						   sector_data[i+0], sector_data[i+1], sector_data[i+2], sector_data[i+3], sector_data[i+4], sector_data[i+5], sector_data[i+6], sector_data[i+7]);
+			} break;
 
-				puts("\nPress any button to continue...");
-				wait_button(0);
+			case 2: {
+				if (examine_bootsector(sector_data) != MBR) {
+					puts("Boot sector type is not MBR.");
+					break;
+				}
+
+				struct mbr* mbr = (struct mbr*)sector_data;
+
+				int resp = SelectionMenu("Partition 1", "Partition 2", "Partition 3", "Partition 4", "Cancel");
+				if (resp <= 0 || resp > 4)
+					break;
+
+				MBRPartition* part = &mbr->partitions[resp - 1];
+				if (!part->type) {
+					puts("Partition does not exist(?)");
+					break;
+				}
+
+				show_sd_bsinfo(bswap32(part->lba_start));
 			} break;
 
 			default: {
 				return;
 			} break;
 		}
+
+		puts("\nPress any button to continue...");
+		wait_button(0);
 	}
+}
+
+// Thank you libdvm
+void show_sd_fsinfo(void) {
+	struct statvfs vfs = {};
+	DvmDisc* disc = sd_dvm_init();
+
+	if (!disc) {
+		puts("sd_dvm_init() failed");
+		return;
+	}
+
+	if (!dvmRegisterFsDriver(&g_vfatFsDriver)) {
+		puts("dvmRegisterFsDriver failed");
+	}
+
+	int res = dvmProbeMountDisc("sd", disc);
+	if (!res) {
+		puts("dvmProbeMountDisc failed");
+		return;
+	}
+	else {
+		res = statvfs("sd:", &vfs);
+		if (res < 0) {
+			perror("statvfs");
+		}
+		else {
+			printf("Cluster size:   %lu\n", vfs.f_bsize);
+			printf("Total clusters: %llu (%lluMiB)\n", vfs.f_blocks, (vfs.f_blocks * vfs.f_bsize) >> 20);
+			printf("Free clusters:  %llu (%lluMiB)\n", vfs.f_bfree, (vfs.f_bfree * vfs.f_bsize) >> 20);
+		}
+	}
+
+	dvmUnmountVolume("sd:");
+}
+
 enum validrive_map {
 	untested  = '\x20',
 	data_ok   = '\xdb',
@@ -504,15 +594,22 @@ int main(int argc, char **argv) {
 		clear();
 		printf("SD utils by thepikachugamer\n\n");
 
-		switch (SelectionMenu("Show CID/CSD info", "Show boot sector info", "Press HOME to exit")) {
+		switch (SelectionMenu("Show CID/CSD info", "Show boot sector info", "Show filesystem info", "Test SD card (ValiDrive)", "Press HOME to exit")) {
 			case 1: {
 				show_sd_cardinfo();
-				puts("\nPress any button to continue...");
-				wait_button(0);
 			} break;
 
 			case 2: {
-				show_sd_bsinfo();
+				show_sd_bsinfo(0);
+			} break;
+
+			case 3: {
+				show_sd_fsinfo();
+			} break;
+
+			case 4: {
+				clear();
+				sd_test_validrive();
 			} break;
 
 			default: {
