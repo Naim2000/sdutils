@@ -1,5 +1,10 @@
 #include <gctypes.h>
 
+#define SD_INSERTED	(1 << 0)
+#define SD_REMOVED	(1 << 1)
+#define SD_LOCKED	(1 << 2)
+#define SD_INITIALIZED (1 << 16)
+
 struct cid {
 	u8   manfid;
 	u16  oemid;
@@ -27,7 +32,7 @@ struct csd {
 	unsigned int		wp_grp_size;
 	unsigned int		read_blkbits;
 	unsigned int		write_blkbits;
-	unsigned long long	capacity;
+	unsigned int		capacity;
 	unsigned int		read_partial:1,
 						read_misalign:1,
 						write_partial:1,
@@ -36,6 +41,8 @@ struct csd {
 						write_protect:2;
 };
 
+int sd_open(void);
+int sd_status(void);
 int sd_init(void);
 int sd_close(void);
 

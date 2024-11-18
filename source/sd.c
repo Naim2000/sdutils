@@ -12,7 +12,7 @@
 
 #include "sd.h"
 
-#define SD_DEBUG 1
+#define SD_DEBUG 2
 #define sd_printf(level, fmt, ...) do { if (level <= SD_DEBUG) printf("%s(): " fmt "\n", __FUNCTION__, ##__VA_ARGS__); } while (0);
 
 static int fd = -1;
@@ -294,36 +294,34 @@ static int sd_send_cid(void)
 static int sd_send_scr(void) {
 	int err;
 	u32 resp[4] = {};
-	u32 scr[2] = {};
 
-	err = sd_app_data_command(51, TYPE_ADTC, RESPONSE_R1, sdcard.rca, 1, sizeof scr, scr, 0, 0, resp, sizeof resp);
+	err = sd_app_data_command(51, TYPE_ADTC, RESPONSE_R1, sdcard.rca, 1, sizeof sdcard.scr_raw, sdcard.scr_raw, 0, 0, resp, sizeof resp);
 
 	if (err) {
 		sd_printf(1, "err=%08x resp=%08x", err, resp[0]);
 		return err;
 	}
 
-	memcpy(sdcard.scr_raw, scr, sizeof scr);
-	sd_printf(2, "scr=%08x%08x", scr[0], scr[1]);
+	DCInvalidateRange(sdcard.scr_raw, sizeof sdcard.scr_raw);
+	sd_printf(2, "scr=%08x%08x", sdcard.scr_raw[0], sdcard.scr_raw[1]);
 	return err;
 }
 
 static int sd_send_ssr(void) {
 	int err;
 	u32 resp[4] = {};
-	u32 ssr[0x10] = {};
 
-	err = sd_app_data_command(13, TYPE_ADTC, RESPONSE_R1, sdcard.rca, 1, sizeof ssr, ssr, 0, 0, resp, sizeof resp);
+	err = sd_app_data_command(13, TYPE_ADTC, RESPONSE_R1, sdcard.rca, 1, sizeof sdcard.ssr_raw, sdcard.ssr_raw, 0, 0, resp, sizeof resp);
 
 	if (err) {
 		sd_printf(1, "err=%08x resp=%08x", err, resp[0]);
 		return err;
 	}
 
-	memcpy(sdcard.ssr_raw, ssr, sizeof ssr);
+	DCInvalidateRange(sdcard.ssr_raw, sizeof sdcard.ssr_raw);
 	sd_printf(2, "SD Status register:");
 	for (int i = 0; i < 0x10; i += 4) {
-		sd_printf(2, "%08x %08x %08x %08x", ssr[i+0], ssr[i+1], ssr[i+2], ssr[i+3]);
+		sd_printf(2, "%08x %08x %08x %08x", sdcard.ssr_raw[i+0], sdcard.ssr_raw[i+1], sdcard.ssr_raw[i+2], sdcard.ssr_raw[i+3]);
 	}
 	return err;
 }
@@ -558,12 +556,63 @@ u32 sd_capacity(void)
 	return csd.capacity;
 }
 
+static int sd_register_event(int ev);
+
+static int sd_event_cb(int res, __attribute__((unused)) void* userdata) {
+	sd_printf(1, "event %#x fired", res);
+	switch (res) {
+		case 1: { // Insert
+			usleep(200000);
+			sd_init();
+		} break;
+
+		case 2: { // Remove
+			memset(&sdcard, 0, sizeof sdcard);
+		} break;
+
+		default:
+			sd_printf(0, "unknown event %#x", res);
+		case 0: // Cancelled
+			return 0;
+		break;
+	}
+
+	sd_register_event((res & 0x3) ^ 0x3);
+	return 0;
+}
+
+static int sd_register_event(int ev) {
+	static u32 cmd[9];
+
+	cmd[0] = 0x40 + (ev == 0);
+	cmd[3] = ev;
+
+	sd_printf(1, "%#x", ev);
+	return IOS_IoctlAsync(fd, 7, cmd, sizeof cmd, 0, 0, sd_event_cb, 0);
+}
+
+int sd_open(void) {
+	if (fd < 0) {
+		int err = fd = IOS_Open("/dev/sdio/slot0", 0);
+		if (err < 0)
+			return err;
+
+		sd_hc_getstatus();
+
+		sd_register_event(sdcard.inserted ? 2 : 1);
+	}
+
+	return 0;
+}
+
 int sd_close(void)
 {
 	int err = 0;
 
 	memset(&sdcard, 0, sizeof sdcard);
 	if (fd >= 0) {
+		sd_register_event(0);
+
 		err = IOS_Close(fd);
 		fd = -1;
 	}
@@ -575,13 +624,10 @@ int sd_init(void)
 {
 	int err;
 
-	sd_close();
-
-	err = fd = IOS_Open("/dev/sdio/slot0", 0);
-	if (err < 0)
+	err = sd_open();
+	if (err)
 		return err;
 
-	sd_hc_getstatus();
 	err = sd_reset_card();
 	sd_hc_getstatus();
 
@@ -626,21 +672,29 @@ int sd_init(void)
 	if (err)
 		goto out;
 
-/*	Not working
 	err = sd_send_scr();
 	if (err)
 		goto out;
 
+	sd_select();
+
 	err = sd_send_ssr();
 	if (err)
 		goto out;
-*/
+
 	sd_deselect();
+
+
 
 	return 0;
 out:
 	sd_deselect();
-	sd_close();
+	// sd_close();
 
 	return err ?: -1;
+}
+
+int sd_status(void) {
+	sd_hc_getstatus();
+	return sdcard.status & (SD_INSERTED | SD_REMOVED | SD_LOCKED | SD_INITIALIZED);
 }

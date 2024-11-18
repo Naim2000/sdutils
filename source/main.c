@@ -1,13 +1,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <gccore.h>
-#include <ogc/machine/processor.h>
+#include <ogc/sha.h>
+#include <ogc/aes.h>
 
 #include "video.h"
 #include "pad.h"
 #include "sd.h"
 
+#define bswap16 __builtin_bswap16
+#define bswap32 __builtin_bswap32
 #define isPowerOfTwo(x) (x && (x & (x - 1)) == 0)
 
 union __attribute__((packed)) chs {
@@ -167,7 +171,7 @@ static int _SelectionMenu(const char* const options[]) {
 		}
 
 		else if (buttons_down(WPAD_BUTTON_HOME)) {
-			selected = -1;
+			selected = 0;
 			break;
 		}
 	}
@@ -180,8 +184,14 @@ static int _SelectionMenu(const char* const options[]) {
 void show_sd_cardinfo(void) {
 	struct cid cid;
 	struct csd csd;
+	u32 cid_raw[4];
 
-	sd_decode_cid(0, &cid);
+	if (!(sd_status() & SD_INITIALIZED)) {
+		printf("SD card not initialized?");
+		return;
+	}
+
+	sd_decode_cid(cid_raw, &cid);
 	sd_decode_csd(0, &csd);
 
 	printf("SD Manufacturer ID:  0x%02x\n", cid.manfid);
@@ -213,10 +223,14 @@ void show_sd_cardinfo(void) {
 		if (csd.cmdclass & (1 << i))
 			printf("+ (%u) %s\n", i, cmdclass_names[i]);
 	}
-	printf("SD Capacity:         %llu MiB (%#llx)\n", csd.capacity >> (20 - 9), csd.capacity);
+	printf("SD Capacity:         %u MiB (%#x)\n", csd.capacity >> (20 - 9), csd.capacity);
 
 	static const char* wrprot_type[4] = { "None", "Temporary", "\x1b[41mPermanent\x1b[40m", "\x1b[41mPermanent(+)\x1b[40m" };
-	printf("SD Write protection: %s\n", wrprot_type[csd.write_protect]);
+	printf("SD Write protection: %s\n\n", wrprot_type[csd.write_protect]);
+
+	printf("Nintendo 3DS ID1:    %08x%08x%08x%08x\n", cid_raw[0], cid_raw[1], cid_raw[2], cid_raw[3]);
+}
+
 }
 
 void show_sd_bsinfo(void) {
@@ -296,19 +310,197 @@ void show_sd_bsinfo(void) {
 			} break;
 		}
 	}
+enum validrive_map {
+	untested  = '\x20',
+	data_ok   = '\xdb',
+	data_bad  = '\xb0',
+	read_err  = '\xb1',
+	write_err = '\xb2',
+};
+
+void sd_test_validrive(void) {
+	printf("=== Validrive test ===\n\n");
+
+	char map[576] = {};
+
+	// Arguments
+	const u32  capacity = sd_capacity(),
+	           capacity_mb = capacity >> (20 - 9),
+	           split    = capacity / sizeof(map),
+	           offset   = 2; // 3rd sector in every section
+
+	printf("SD capacity: %u MiB (%#x/%u sectors)\n", capacity_mb, capacity, capacity);
+	printf("%u sectors in %u sections; testing sector %u in each section\n\n", split, sizeof map, offset);
+
+	if (capacity_mb % 1000 <= 1 && isPowerOfTwo(capacity_mb / 1000)) {
+		printf("This SD card's capacity is a suspicious multiple of 1000.\n");
+		printf("I don't trust it either.\n\n");
+	}
+
+	if (offset >= split) {
+		printf("This SD card seems too small...\n");
+		printf("(?????? Is this a <=256MB card???\?)\n");
+		return;
+	}
+
+	if (sd_status() & SD_LOCKED) {
+		printf("The SD card is locked.\n");
+		printf("Check the slider on the left side of the SD card.\n");
+		return;
+	}
+
+	printf("=== DISCLAIMER:\n");
+	printf("Data retention is not guaranteed, I don't verify the old data\n");
+	printf("after writing it back.\n\n");
+
+	printf("If there's anything here that you care about: Back it up.\n\n");
+
+	printf("Press +/START to begin test.\n");
+	printf("Press any other button to cancel.\n");
+
+	if (!(wait_button(0) & WPAD_BUTTON_PLUS))
+		return;
+
+	__attribute__((aligned(0x40)))
+	static u32 test_data[0x80],
+	           sector_data_r[0x80],
+	           sector_data_w[0x80],
+               sector_data_hash[5],
+	           test_data_hash[5];
+
+	int        read_errors = 0,
+	           write_errors = 0,
+	           good_sectors = 0,
+               bad_sectors  = 0;
+
+
+	clear();
+	printf("Testing SD card (ValiDrive)...\n\n");
+
+	// Clear map cause we're gonna be printing this to screen
+	memset(map, untested, sizeof map);
+
+	// Put in some data
+	for (int i = 0; i < 0x10; i++) {
+		test_data[i + 0x00] = 0x5555AAAA;
+		test_data[i + 0x10] = 0xFFFFFFFF;
+		test_data[i + 0x20] = 0x00000000;
+		test_data[i + 0x30] = 0x11111111;
+		test_data[i + 0x40] = 0x22222222;
+		test_data[i + 0x50] = 0x44444444;
+		test_data[i + 0x60] = 0x88888888;
+		test_data[i + 0x70] = 0x12345678;
+	}
+
+	// And hash it. I am not going to memcmp a 512 byte block 576 times.
+	if (SHA_Init() < 0 || AES_Init() < 0) {
+		printf("SHA_Init() or AES_Init() failed, what is this, an old Dolphin emulator?\n");
+		return;
+	}
+
+	// Should I encrypt it too? // Yes.
+	u32 keydata[4];
+	static char iv[16] __attribute__((aligned(4))) = "thepikachugamer";
+	sd_decode_cid(keydata, 0);
+
+	printf("keydata:        %08x%08x%08x%08x\n", keydata[0], keydata[1], keydata[2], keydata[3]);
+	printf("iv:             %s\n", iv);
+
+	AES_Encrypt(keydata, sizeof keydata, iv, sizeof iv, test_data, test_data, sizeof test_data);
+
+	__attribute__((aligned(0x20))) // Libogc, why? It's an array of words that i'm pretty sure IOS writes to itself. I mean, look at the /dev/sha exploit. That doesn't data abort.
+	sha_context ctx;
+	SHA_InitializeContext(&ctx);
+	SHA_Calculate(&ctx, test_data, sizeof test_data, test_data_hash);
+	printf("test_data_hash: %08x%08x%08x%08x%08x\n", test_data_hash[0], test_data_hash[1], test_data_hash[2], test_data_hash[3], test_data_hash[4]);
+
+	for (int i = 0; i < sizeof(map); i++) {
+		u32 sector = (i * split) + offset;
+
+		printf("\r Testing sector 0x%08x ... (%i/%i) ", sector, i + 1, sizeof(map));
+		int ret = sd_read(sector, 1, sector_data_r);
+		if (ret) {
+			map[i] = read_err;
+			read_errors++;
+			continue;
+		}
+
+		ret = sd_write(sector, 1, test_data);
+		if (ret) {
+			map[i] = write_err;
+			write_errors++;
+			continue;
+		}
+
+		ret = sd_read(sector, 1, sector_data_w);
+		if (ret) {
+			map[i] = read_err;
+			read_errors++;
+			continue;
+		}
+
+		SHA_InitializeContext(&ctx);
+		SHA_Calculate(&ctx, sector_data_w, sizeof sector_data_w, sector_data_hash);
+		if (memcmp(sector_data_hash, test_data_hash, sizeof test_data_hash) == 0) {
+			map[i] = data_ok;
+			good_sectors++;
+		}
+		else {
+			map[i] = data_bad;
+			bad_sectors++;
+		}
+
+		ret = sd_write(sector, 1, sector_data_r);
+		if (ret) {
+			map[i] = write_err;
+			write_errors++;
+		}
+	}
+
+	clear();
+	printf("Test results: \n");
+	printf("+ Good sectors: %i\n", good_sectors);
+	printf("+ Bad sectors:  %i\n", bad_sectors);
+	printf("+ Read errors:  %i\n", read_errors);
+	printf("+ Write errors: %i\n\n", write_errors);
+
+	printf("Result map:\n");
+	const int map_height = 9;
+	const int map_width  = sizeof(map) / map_height;
+	for (int i = 0; i < map_height; i++)
+		printf("%.*s\n", map_width, map + (i * map_width));
+
+	return;
 }
 
 int main(int argc, char **argv) {
 	puts("Hello World!");
 
 	initpads();
-	int ret = sd_init();
+	sd_open();
+	sd_init();
+	/*
 	if (ret < 0) {
 		printf("sd_init() failed (%i)\n", ret);
 		goto waitexit;
 	}
+	*/
 
 	while (true) {
+#if 0
+		if (!(sd_status() & SD_INSERTED)) {
+			clear();
+			printf("Please insert an SD card...\n");
+			printf("Press HOME to cancel.\n");
+			while (!(sd_status() & SD_INSERTED)) {
+				scanpads();
+				if (buttons_down(WPAD_BUTTON_HOME))
+					goto exit;
+
+				usleep(200000);
+			}
+		}
+#endif
 		clear();
 		printf("SD utils by thepikachugamer\n\n");
 
@@ -327,9 +519,11 @@ int main(int argc, char **argv) {
 				goto exit;
 			} break;
 		}
+
+		puts("\nPress any button to continue...");
+		wait_button(0);
 	}
 
-waitexit:
 	puts("Press any button to exit.");
 	wait_button(0);
 exit:
