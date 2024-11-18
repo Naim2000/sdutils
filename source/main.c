@@ -161,11 +161,15 @@ static int examine_bootsector(void* ptr) {
 
 #define SelectionMenu(...) _SelectionMenu((const char* const[]){ __VA_ARGS__, NULL } )
 static int _SelectionMenu(const char* const options[]) {
-	int posX, posY, selected = 0;
+	int posX, posY, conX, conY;
+	int selected = 0;
+	CON_GetMetrics(&conX, &conY);
 	CON_GetPosition(&posX, &posY);
 
 	int count = -1;
 	while (options[++count]);
+
+	if (posY + count > conY) posY = (conY - 1) - count;
 
 	while (true) {
 		printf("\x1b[%i;0H", posY);
@@ -197,7 +201,6 @@ static int _SelectionMenu(const char* const options[]) {
 		}
 	}
 
-	putchar('\n');
 	putchar('\n');
 	return selected;
 }
@@ -323,6 +326,7 @@ void show_sd_bsinfo(u32 sector) {
 
 	while (true) {
 		clear();
+		printf("Sector %#x (%u)\n\n", sector, sector);
 		print_bsinfo(sector_data);
 
 		printf("\n");
@@ -345,7 +349,7 @@ void show_sd_bsinfo(u32 sector) {
 
 				int resp = SelectionMenu("Partition 1", "Partition 2", "Partition 3", "Partition 4", "Cancel");
 				if (resp <= 0 || resp > 4)
-					break;
+					continue;
 
 				MBRPartition* part = &mbr->partitions[resp - 1];
 				if (!part->type) {
@@ -354,6 +358,7 @@ void show_sd_bsinfo(u32 sector) {
 				}
 
 				show_sd_bsinfo(bswap32(part->lba_start));
+				continue;
 			} break;
 
 			default: {
@@ -601,6 +606,7 @@ int main(int argc, char **argv) {
 
 			case 2: {
 				show_sd_bsinfo(0);
+				continue;
 			} break;
 
 			case 3: {
