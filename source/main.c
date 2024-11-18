@@ -417,7 +417,7 @@ enum validrive_map {
 };
 
 void sd_test_validrive(void) {
-	printf("=== Validrive test ===\n\n");
+	printf("=== ValiDrive test ===\n\n");
 
 	char map[576] = {};
 
