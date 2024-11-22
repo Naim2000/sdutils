@@ -441,19 +441,10 @@ void sd_test_validrive(void) {
 
 	// Should I encrypt it too? // Yes.
 	u32 keydata[4];
-	static char iv[16] __attribute__((aligned(4))) = "thepikachugamer";
 	sd_decode_cid(keydata, 0);
-
-	printf("keydata:        %08x%08x%08x%08x\n", keydata[0], keydata[1], keydata[2], keydata[3]);
-	printf("iv:             %s\n", iv);
-
-	AES_Encrypt(keydata, sizeof keydata, iv, sizeof iv, test_data, test_data, sizeof test_data);
 
 	__attribute__((aligned(0x20))) // Libogc, why? It's an array of words that i'm pretty sure IOS writes to itself. I mean, look at the /dev/sha exploit. That doesn't data abort.
 	sha_context ctx;
-	SHA_InitializeContext(&ctx);
-	SHA_Calculate(&ctx, test_data, sizeof test_data, test_data_hash);
-	printf("test_data_hash: %08x%08x%08x%08x%08x\n", test_data_hash[0], test_data_hash[1], test_data_hash[2], test_data_hash[3], test_data_hash[4]);
 
 	for (int i = 0; i < sizeof(map); i++) {
 		u32 sector = (i * split) + offset;
@@ -466,7 +457,13 @@ void sd_test_validrive(void) {
 			continue;
 		}
 
-		ret = sd_write(sector, 1, test_data);
+		u32 ivdata[4] = { capacity, split, offset, sector };
+		AES_Encrypt(keydata, sizeof keydata, ivdata, sizeof ivdata, test_data, sector_data_w, sizeof test_data);
+
+		SHA_InitializeContext(&ctx);
+		SHA_Calculate(&ctx, sector_data_w, sizeof sector_data_w, test_data_hash);
+
+		ret = sd_write(sector, 1, sector_data_w);
 		if (ret) {
 			map[i] = write_err;
 			write_errors++;
