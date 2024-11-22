@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <ogc/ipc.h>
 #include <ogc/cache.h>
+#include <ogc/machine/processor.h>
 
 #include "sd.h"
 
@@ -556,9 +557,12 @@ u32 sd_capacity(void)
 	return csd.capacity;
 }
 
+#if 0
 static int sd_register_event(int ev);
 
 static int sd_event_cb(int res, __attribute__((unused)) void* userdata) {
+	u32 msr;
+	_CPU_ISR_Disable(msr); // ?
 	sd_printf(1, "event %#x fired", res);
 	switch (res) {
 		case 1: { // Insert
@@ -573,11 +577,13 @@ static int sd_event_cb(int res, __attribute__((unused)) void* userdata) {
 		default:
 			sd_printf(0, "unknown event %#x", res);
 		case 0: // Cancelled
-			return 0;
+			// return 0;
 		break;
 	}
 
-	sd_register_event((res & 0x3) ^ 0x3);
+	sd_hc_getstatus();
+	sd_register_event(sdcard.inserted ? 2 : 1);
+	_CPU_ISR_Restore(msr);
 	return 0;
 }
 
@@ -587,10 +593,11 @@ static int sd_register_event(int ev) {
 	cmd[0] = 0x40 + (ev == 0);
 	cmd[3] = ev;
 
-	sd_printf(1, "%#x", ev);
-	return IOS_IoctlAsync(fd, 7, cmd, sizeof cmd, 0, 0, sd_event_cb, 0);
+	int err = IOS_IoctlAsync(fd, 7, cmd, sizeof cmd, 0, 0, sd_event_cb, 0);
+	sd_printf(1, "%#x : %i", ev, err);
+	return err;
 }
-
+#endif
 int sd_open(void) {
 	if (fd < 0) {
 		int err = fd = IOS_Open("/dev/sdio/slot0", 0);
@@ -599,7 +606,7 @@ int sd_open(void) {
 
 		sd_hc_getstatus();
 
-		sd_register_event(sdcard.inserted ? 2 : 1);
+		// return sd_register_event(sdcard.inserted ? 2 : 1);
 	}
 
 	return 0;
@@ -611,7 +618,7 @@ int sd_close(void)
 
 	memset(&sdcard, 0, sizeof sdcard);
 	if (fd >= 0) {
-		sd_register_event(0);
+		// sd_register_event(0);
 
 		err = IOS_Close(fd);
 		fd = -1;

@@ -185,7 +185,7 @@ static void print_bsinfo(u32* sector) {
 
 			printf("Boot sector type: MBR\n");
 			if (mbr->disk_sig)
-				printf("Disk signature:   %08x\n", bswap32(mbr->disk_sig));
+				printf("Disk signature:   0x%08x\n", bswap32(mbr->disk_sig));
 
 			for (int i = 0; i < 4; i++) {
 				MBRPartition* part = &mbr->partitions[i];
@@ -261,13 +261,13 @@ void show_sd_bsinfo(u32 sector) {
 
 	if (!(sd_status() & SD_INITIALIZED)) {
 		printf("SD card not initialized?");
-		return;
+		goto out;
 	}
 
 	int ret = sd_read(sector, 1, sector_data);
 	if (ret < 0) {
 		printf("sd_read failed (%i)\n", ret);
-		return;
+		goto out;
 	}
 
 	while (true) {
@@ -315,6 +315,10 @@ void show_sd_bsinfo(u32 sector) {
 		puts("\nPress any button to continue...");
 		wait_button(0);
 	}
+
+out:
+	puts("\nPress any button to continue...");
+	wait_button(0);
 }
 
 // Thank you libdvm
@@ -369,6 +373,11 @@ void sd_test_validrive(void) {
 	           capacity_mb = capacity >> (20 - 9),
 	           split    = capacity / sizeof(map),
 	           offset   = 2; // 3rd sector in every section
+
+	if (!(sd_status() & SD_INITIALIZED)) {
+		printf("SD card not initialized?\n");
+		return;
+	}
 
 	printf("SD capacity: %u MiB (%#x/%u sectors)\n", capacity_mb, capacity, capacity);
 	printf("%u sectors in %u sections; testing sector %u in each section\n\n", split, sizeof map, offset);
@@ -515,14 +524,12 @@ int main(int argc, char **argv) {
 	puts("Hello World!");
 
 	initpads();
-	sd_open();
-	sd_init();
-	/*
+	int ret = sd_init();
+
 	if (ret < 0) {
 		printf("sd_init() failed (%i)\n", ret);
 		goto waitexit;
 	}
-	*/
 
 	while (true) {
 #if 0
@@ -570,6 +577,7 @@ int main(int argc, char **argv) {
 		wait_button(0);
 	}
 
+waitexit:
 	puts("Press any button to exit.");
 	wait_button(0);
 exit:
